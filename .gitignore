@@ -1,0 +1,32 @@
+# Keil MDK build outputs
+*.o
+*.d
+*.crf
+*.axf
+*.lst
+*.map
+*.htm
+*.lnp
+*.dep
+*.iex
+*.sct.bak
+*.build_log.htm
+*.bak
+*.__i
+*._ia
+*.tra
+JLinkLog.txt
+**/MDK-ARM/*/Objects/
+**/MDK-ARM/*/Listings/
+**/MDK-ARM/DebugConfig/
+**/MDK-ARM/RTE/_*/
+
+# Keil per-user settings
+*.uvguix.*
+*.uvoptx.bak
+*.uvprojx.bak
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vscode/
