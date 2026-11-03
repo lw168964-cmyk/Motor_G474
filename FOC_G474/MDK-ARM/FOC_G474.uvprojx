@@ -1398,6 +1398,16 @@
               <FileType>5</FileType>
               <FilePath>..\UserLib\Control.h</FilePath>
             </File>
+            <File>
+              <FileName>Sample.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\UserLib\Sample.c</FilePath>
+            </File>
+            <File>
+              <FileName>Sample.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\UserLib\Sample.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

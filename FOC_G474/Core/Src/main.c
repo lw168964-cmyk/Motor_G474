@@ -32,6 +32,8 @@
 #include "arm_math.h"
 #include "OLED.h"
 #include "Control.h"
+#include "Sample.h"
+#include "AS5048_SPI.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,13 +48,13 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+extern CurrentSample_t current_sample;  //三相电流采样值，单位[A]，在ADC2注入转换完成回调中更新
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+AS5048A_HandleTypeDef as5048a;   //磁编码器句柄，TIM1 PWM输入捕获（PC0）
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -104,7 +106,11 @@ int main(void)
   MX_UART4_Init();
   MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
-
+  AS5048A_Init(&as5048a, &htim1);
+  if (AS5048A_Start(&as5048a) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -118,6 +124,13 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    //编码器调试显示：周期计数（应约42500）、高电平计数、角度[rad]、错误帧数
+    OLED_ShowNum(0, 0,  AS5048A_GetPeriodTicks(&as5048a), 5, OLED_8X16);
+    OLED_ShowNum(0, 16, AS5048A_GetHighTicks(&as5048a),   5, OLED_8X16);
+    OLED_ShowFloatNum(0, 32, AS5048A_ReadAngleRad(&as5048a), 1, 3, OLED_8X16);
+    OLED_ShowNum(0, 48, as5048a.error_count, 5, OLED_8X16);
+    OLED_Update();
+    HAL_Delay(50);
   }
   /* USER CODE END 3 */
 }
@@ -168,6 +181,11 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+//TIM1输入捕获回调：每个PWM上升沿进入一次，解码上一帧角度
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+  AS5048A_CaptureCallback(&as5048a, htim);
+}
 
 /* USER CODE END 4 */
 

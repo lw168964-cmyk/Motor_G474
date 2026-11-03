@@ -81,6 +81,8 @@ virtualFolder:
         - path: ../UserLib/OLED_Data.h
         - path: ../UserLib/Control.c
         - path: ../UserLib/Control.h
+        - path: ../UserLib/Sample.c
+        - path: ../UserLib/Sample.h
       folders: []
     - name: ::CMSIS
       files: []
