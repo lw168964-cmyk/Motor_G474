@@ -26,8 +26,10 @@
 #define ALIGN_HOLD_TICKS  (PWM_FREQ)          //1.0s：电角度0，等转子稳定
 //校验：每段开环转动的电周期数，14个电周期 = 机械1圈
 #define CHECK_CYCLES      POLE_PAIRS
-//转速计算窗口：200个控制周期 = 10ms（缩短窗口减少延迟）
-#define SPEED_WINDOW      200U
+//编码器：AS5048A PWM输出约1kHz，TIM1计数频率42.5MHz（见AS5048A_SPI.c）
+#define ENC_TIM_CLK_HZ    42500000.0f
+#define ENC_DT_DEFAULT    0.001f              //周期读数异常时使用的帧周期[s]
+#define RAD_S_TO_RPM      (60.0f / TWO_PI_F)
 
 //电机：Rs=10.32Ω，Ls=3.26mH，额定0.9A，14对极；2V对应约0.19A，电压不要超过9V
 volatile float align_ud   = 2.0f;             //对齐/校验阶段d轴电压[V]
@@ -36,7 +38,7 @@ volatile float foc_uq     = 1.0f;             //电压模式：RUN阶段q轴电�
 volatile uint8_t foc_restart = 0;             //调试器中置1：重新执行对齐和校验
 
 //电流环参数（可在调试器中在线修改）
-volatile uint8_t foc_mode = 2;                //控制模式：0=电压，1=电流，2=速度
+volatile uint8_t foc_mode = 3;                //控制模式：0=电压，1=电流，2=速度，3=位置
 volatile float id_ref = 0.0f;                 //d轴目标电流[A]，id=0控制（最大转矩/电流比）
 volatile float iq_ref = 0.2f;                 //q轴目标电流[A]，控制转矩（额定0.9A）
 volatile float current_kp = 4.89f;            //电流环Kp = Ls × ωc = 0.00326 × 1500
@@ -44,8 +46,14 @@ volatile float current_ki = 12000.0f;         //电流环Ki = Rs × ωc = 10.32 
 
 //速度环参数（可在调试器中在线修改）
 volatile float rpm_ref = 50.0f;              //目标转速[rpm]
-volatile float speed_kp = 0.0002f;            //速度环Kp，输出单位[A/rpm]（降低到原来1/25）
-volatile float speed_ki = 0.002f;             //速度环Ki（降低到原来1/25）
+volatile float speed_kp = 0.001f;             //速度环Kp，输出单位[A/rpm]
+volatile float speed_ki = 0.02f;              //速度环Ki，输出单位[A/(rpm·s)]
+volatile float speed_lpf_tau = 0.005f;        //转速低通时间常数[s]，越大越平滑、延迟越大
+
+//位置环参数（可在调试器中在线修改）
+volatile float pos_ref = 0.0f;                //目标位置[rad]，机械角度
+volatile float position_kp = 50.0f;           //位置环Kp，输出单位[rpm/rad]
+volatile float position_ki = 0.0f;            //位置环Ki（位置环只用P，静差由速度环积分消除）
 
 volatile FocDebug_t foc_dbg;
 
@@ -61,6 +69,9 @@ static PI_Controller_t pi_iq;
 //速度环PI控制器
 static PI_Controller_t pi_speed;
 
+//位置环PI控制器
+static PI_Controller_t pi_position;
+
 //状态机内部变量（只在ADC2注入回调中访问）
 static FocState_t state = FOC_STATE_ALIGN;
 static uint32_t   tick = 0;                    //当前阶段已运行的控制周期数
@@ -69,8 +80,12 @@ static float      mech_prev = 0.0f;            //上一次机械角
 static float      mech_accum = 0.0f;           //CHECK第一段机械角累计增量
 static float      diff_sum = 0.0f, diff_min = 0.0f, diff_max = 0.0f;
 static uint32_t   diff_n = 0;
-static float      spd_accum = 0.0f;
-static uint32_t   spd_n = 0;
+//转速估计：每收到一帧编码器数据计算一次
+static uint32_t   enc_frames_prev = 0;         //上次处理时的帧计数（有效帧+无效帧）
+static float      enc_angle_prev = 0.0f;       //上一帧的机械角[rad]
+static uint8_t    enc_started = 0;             //0：还没有基准帧
+//外环输出，在两帧编码器数据之间保持不变
+static float      iq_cmd_hold = 0.0f;
 
 static uint16_t Cmp_Limit(uint16_t cmp)
 {
@@ -102,31 +117,36 @@ void PI_Init(PI_Controller_t *pi, float kp, float ki, float out_min, float out_m
   pi->out_max = out_max;
 }
 
-//PI控制器更新（带抗饱和）
+//PI控制器更新（条件积分抗饱和）
 float PI_Update(PI_Controller_t *pi, float error, float dt)
 {
-  float p_term, i_term, output;
+  float p_term, output, integral_new;
 
-  //比例项
   p_term = pi->kp * error;
 
-  //积分项（梯形积分）
-  pi->integral += error * dt;
-  i_term = pi->ki * pi->integral;
+  //ki=0时清掉积分，避免之后改ki时积分值突然生效
+  if (pi->ki == 0.0f)
+  {
+    pi->integral = 0.0f;
+  }
 
-  //输出
-  output = p_term + i_term;
+  //先试算本次积分，输出未饱和、或误差方向能让输出退出饱和时才接受
+  integral_new = pi->integral + error * dt;
+  output = p_term + pi->ki * integral_new;
 
-  //抗饱和：输出限幅后反算积分项，防止积分饱和
   if (output > pi->out_max)
   {
+    if (error < 0.0f) pi->integral = integral_new;
     output = pi->out_max;
-    pi->integral = (output - p_term) / pi->ki;
   }
   else if (output < pi->out_min)
   {
+    if (error > 0.0f) pi->integral = integral_new;
     output = pi->out_min;
-    pi->integral = (output - p_term) / pi->ki;
+  }
+  else
+  {
+    pi->integral = integral_new;
   }
 
   return output;
@@ -190,6 +210,9 @@ void Driver_Init(void)
 
   //初始化速度环PI控制器，输出限幅为额定电流0.9A
   PI_Init(&pi_speed, speed_kp, speed_ki, -0.9f, 0.9f);
+
+  //初始化位置环PI控制器，输出限幅为最大转速±500rpm
+  PI_Init(&pi_position, position_kp, position_ki, -500.0f, 500.0f);
 
   Reset_StateMachine();
 
@@ -348,6 +371,8 @@ static void State_Check(float theta_m, float dm)
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
   float theta_m, dm;
+  float outer_dt = ENC_DT_DEFAULT;   //本次外环更新的时间间隔[s]
+  uint8_t outer_update = 0;          //1：本周期收到新编码器帧，位置环/速度环更新一次
   uint32_t t0 = DWT->CYCCNT;
 
   if (hadc->Instance != ADC2)
@@ -370,13 +395,31 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef* hadc)
   mech_prev = theta_m;
   foc_dbg.theta_m = theta_m;
 
-  //转速：20ms窗口内机械角增量
-  spd_accum += dm;
-  if (++spd_n >= SPEED_WINDOW)
+  //转速：每来一帧新编码器数据（约1ms）算一次差分，再一阶低通
+  //原来按固定窗口统计，窗口内只有10~50帧，12位分辨率下量化噪声大、延迟长，速度环增益上不去
   {
-    foc_dbg.rpm = spd_accum / ((float)SPEED_WINDOW * PWM_TS) * (60.0f / TWO_PI_F);
-    spd_accum = 0.0f;
-    spd_n = 0;
+    uint32_t frames = as5048a.frame_count + as5048a.error_count;
+    if (!enc_started)
+    {
+      enc_frames_prev = frames;
+      enc_angle_prev = theta_m;
+      enc_started = 1;
+    }
+    else if (frames != enc_frames_prev)
+    {
+      uint32_t n = frames - enc_frames_prev;   //中间有无效帧时n>1，角度增量跨了n个周期
+      uint32_t per = as5048a.period_ticks;
+      float frame_dt = (per >= 36000U && per <= 50000U) ? ((float)per / ENC_TIM_CLK_HZ) : ENC_DT_DEFAULT;
+      float dt = frame_dt * (float)n;
+      float rpm_raw = WrapPi(theta_m - enc_angle_prev) / dt * RAD_S_TO_RPM;
+      float alpha = dt / (speed_lpf_tau + dt);
+
+      foc_dbg.rpm += alpha * (rpm_raw - foc_dbg.rpm);
+      enc_frames_prev = frames;
+      enc_angle_prev = theta_m;
+      outer_dt = dt;
+      outer_update = 1;
+    }
   }
 
   if (foc_restart)
@@ -433,62 +476,61 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef* hadc)
       //先采样电流并计算Id、Iq（用于电流环反馈）
       Update_Idq(theta_e);
 
-      //根据控制模式选择输出
-      if (foc_mode == FOC_MODE_SPEED)
+      //支持在线调参
+      pi_id.kp = current_kp;   pi_id.ki = current_ki;
+      pi_iq.kp = current_kp;   pi_iq.ki = current_ki;
+      pi_speed.kp = speed_kp;  pi_speed.ki = speed_ki;
+      pi_position.kp = position_kp;  pi_position.ki = position_ki;
+
+      //不用的外环保持复位，切换模式时从零开始
+      if (foc_mode != FOC_MODE_POSITION)
       {
-        //速度闭环模式：速度环PI→电流环PI→电压
-        //更新速度环PI参数（支持在线调整）
-        pi_speed.kp = speed_kp;
-        pi_speed.ki = speed_ki;
-
-        //速度环PI控制，输出为目标q轴电流
-        float rpm_err = rpm_ref - foc_dbg.rpm;
-        float iq_cmd = PI_Update(&pi_speed, rpm_err, PWM_TS);
-
-        //电流环PI控制
-        pi_id.kp = current_kp;
-        pi_id.ki = current_ki;
-        pi_iq.kp = current_kp;
-        pi_iq.ki = current_ki;
-
-        float id_err = id_ref - foc_dbg.id;
-        float iq_err = iq_cmd - foc_dbg.iq;
-        ud_out = PI_Update(&pi_id, id_err, PWM_TS);
-        uq_out = PI_Update(&pi_iq, iq_err, PWM_TS);
-
-        foc_dbg.mode = FOC_MODE_SPEED;
+        PI_Reset(&pi_position);
       }
-      else if (foc_mode == FOC_MODE_CURRENT)
+      if ((foc_mode != FOC_MODE_POSITION) && (foc_mode != FOC_MODE_SPEED))
       {
-        //电流闭环模式：电流环PI→电压
-        pi_id.kp = current_kp;
-        pi_id.ki = current_ki;
-        pi_iq.kp = current_kp;
-        pi_iq.ki = current_ki;
-
-        float id_err = id_ref - foc_dbg.id;
-        float iq_err = iq_ref - foc_dbg.iq;
-        ud_out = PI_Update(&pi_id, id_err, PWM_TS);
-        uq_out = PI_Update(&pi_iq, iq_err, PWM_TS);
-
-        //切换到电流模式时复位速度环积分项
         PI_Reset(&pi_speed);
-
-        foc_dbg.mode = FOC_MODE_CURRENT;
+        iq_cmd_hold = 0.0f;
       }
-      else
+
+      //外环（位置、速度）跟随编码器帧率运行，约1kHz；两帧之间保持输出
+      //编码器数据1ms才更新一次，20kHz运行外环只会重复用同一个角度，没有意义
+      if (outer_update && ((foc_mode == FOC_MODE_POSITION) || (foc_mode == FOC_MODE_SPEED)))
+      {
+        float rpm_cmd;
+
+        if (foc_mode == FOC_MODE_POSITION)
+        {
+          float pos_err = WrapPi(pos_ref - theta_m);   //最短路径误差[-π, π)
+          foc_dbg.pos_err = pos_err;
+          rpm_cmd = PI_Update(&pi_position, pos_err, outer_dt);
+        }
+        else
+        {
+          rpm_cmd = rpm_ref;
+        }
+        foc_dbg.rpm_cmd = rpm_cmd;
+
+        iq_cmd_hold = PI_Update(&pi_speed, rpm_cmd - foc_dbg.rpm, outer_dt);
+        foc_dbg.iq_cmd = iq_cmd_hold;
+      }
+
+      if (foc_mode == FOC_MODE_VOLTAGE)
       {
         //电压模式：直接使用设定的电压值
         ud_out = 0.0f;
         uq_out = foc_uq;
-
-        //切换到电压模式时复位所有PI积分项
         PI_Reset(&pi_id);
         PI_Reset(&pi_iq);
-        PI_Reset(&pi_speed);
-
-        foc_dbg.mode = FOC_MODE_VOLTAGE;
       }
+      else
+      {
+        //电流环：电流模式用iq_ref，速度/位置模式用外环输出
+        float iq_target = (foc_mode == FOC_MODE_CURRENT) ? iq_ref : iq_cmd_hold;
+        ud_out = PI_Update(&pi_id, id_ref - foc_dbg.id, PWM_TS);
+        uq_out = PI_Update(&pi_iq, iq_target - foc_dbg.iq, PWM_TS);
+      }
+      foc_dbg.mode = foc_mode;
 
       //记录实际输出电压
       foc_dbg.ud = ud_out;

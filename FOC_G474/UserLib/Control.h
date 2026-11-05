@@ -17,7 +17,8 @@ typedef enum
 {
   FOC_MODE_VOLTAGE = 0,  //电压模式：直接设置Ud、Uq
   FOC_MODE_CURRENT,      //电流模式：电流环闭环控制Id、Iq
-  FOC_MODE_SPEED         //速度模式：速度环→电流环→电压
+  FOC_MODE_SPEED,        //速度模式：速度环→电流环→电压
+  FOC_MODE_POSITION      //位置模式：位置环→速度环→电流环→电压
 } FocMode_t;
 
 //PI控制器
@@ -48,9 +49,12 @@ typedef struct
   float   diff_span;     //CHECK阶段角度差最大值-最小值[rad]
   float   id;            //d轴电流（低通后）[A]
   float   iq;            //q轴电流（低通后）[A]
-  float   rpm;           //机械转速[rpm]
+  float   rpm;           //机械转速[rpm]（每帧编码器差分+一阶低通）
   float   ud;            //d轴电压输出[V]
   float   uq;            //q轴电压输出[V]
+  float   pos_err;       //位置误差[rad]
+  float   rpm_cmd;       //位置环输出的目标转速[rpm]
+  float   iq_cmd;        //速度环输出的目标q轴电流[A]
 
   //诊断量
   uint32_t isr_cnt;      //ADC2回调执行次数，正常每秒增加20000
@@ -78,6 +82,12 @@ extern volatile float current_ki;    //电流环积分增益
 extern volatile float rpm_ref;       //目标转速[rpm]
 extern volatile float speed_kp;      //速度环比例增益
 extern volatile float speed_ki;      //速度环积分增益
+extern volatile float speed_lpf_tau; //转速低通滤波时间常数[s]
+
+//位置环控制参数
+extern volatile float pos_ref;       //目标位置[rad]，机械角度
+extern volatile float position_kp;   //位置环比例增益
+extern volatile float position_ki;   //位置环积分增益
 
 void Driver_Init(void);
 void Driver_Enable(void);
