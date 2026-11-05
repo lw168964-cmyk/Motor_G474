@@ -34,6 +34,8 @@
 #include "Control.h"
 #include "Sample.h"
 #include "AS5048_SPI.h"
+#include <stdio.h>
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -65,7 +67,26 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+//浮点数转定点字符串，例如 Fx(buf, -1.2345f, 3) -> "-1.235"
+//不依赖printf的%f，避免OLED上浮点显示被截断
+static char *Fx(char *buf, float v, uint8_t dec)
+{
+  static const int32_t p10[4] = {1, 10, 100, 1000};
+  int32_t s;
+  char sign = (v < 0.0f) ? '-' : '+';
 
+  if (dec > 3U) dec = 3U;
+  s = (int32_t)(fabsf(v) * (float)p10[dec] + 0.5f);
+  if (dec == 0U)
+  {
+    sprintf(buf, "%c%ld", sign, (long)s);
+  }
+  else
+  {
+    sprintf(buf, "%c%ld.%0*ld", sign, (long)(s / p10[dec]), (int)dec, (long)(s % p10[dec]));
+  }
+  return buf;
+}
 /* USER CODE END 0 */
 
 /**
@@ -117,20 +138,28 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   OLED_Init();
   Driver_Init();
-  Driver_Enable();   //开环在ADC2注入转换完成回调中执行（Control.c）
+  Driver_Enable();   //对齐->校验->电压模式FOC，在ADC2注入转换完成回调中执行（Control.c）
 
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    //编码器调试显示：周期计数（应约42500）、高电平计数、角度[rad]、错误帧数
-    OLED_ShowNum(0, 0,  AS5048A_GetPeriodTicks(&as5048a), 5, OLED_8X16);
-    OLED_ShowNum(0, 16, AS5048A_GetHighTicks(&as5048a),   5, OLED_8X16);
-    OLED_ShowFloatNum(0, 32, AS5048A_ReadAngleRad(&as5048a), 1, 3, OLED_8X16);
-    OLED_ShowNum(0, 48, as5048a.error_count, 5, OLED_8X16);
+    //FOC调试显示（6x8字体，8行）
+    {
+      char a[16], b[16];
+      OLED_Clear();
+      OLED_Printf(0,  0, OLED_6X8, "S:%d F:%d dir:%d", (int)foc_dbg.state, (int)foc_dbg.fault, (int)foc_dbg.dir);
+      OLED_Printf(0,  8, OLED_6X8, "pole:%s n:%lu", Fx(a, foc_dbg.pole_ratio, 2), (unsigned long)(foc_dbg.isr_cnt / 20000U));
+      OLED_Printf(0, 16, OLED_6X8, "m0r:%s m0:%s", Fx(a, foc_dbg.theta_m0_raw, 3), Fx(b, foc_dbg.theta_m0, 3));
+      OLED_Printf(0, 24, OLED_6X8, "fw:%s rv:%s", Fx(a, foc_dbg.diff_fwd, 3), Fx(b, foc_dbg.diff_rev, 3));
+      OLED_Printf(0, 32, OLED_6X8, "avg:%s sp:%s", Fx(a, foc_dbg.diff_mean, 3), Fx(b, foc_dbg.diff_span, 3));
+      OLED_Printf(0, 40, OLED_6X8, "id:%s iq:%s", Fx(a, foc_dbg.id, 3), Fx(b, foc_dbg.iq, 3));
+      OLED_Printf(0, 48, OLED_6X8, "rpm:%s uq:%s", Fx(a, foc_dbg.rpm, 1), Fx(b, foc_uq, 1));
+      OLED_Printf(0, 56, OLED_6X8, "th:%s e:%lu", Fx(a, foc_dbg.theta_m, 3), (unsigned long)as5048a.error_count);
+    }
     OLED_Update();
-    HAL_Delay(50);
+    HAL_Delay(100);
   }
   /* USER CODE END 3 */
 }
