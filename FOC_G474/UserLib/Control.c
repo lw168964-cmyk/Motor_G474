@@ -41,18 +41,29 @@ volatile uint8_t foc_restart = 0;             //调试器中置1：重新执行�
 volatile uint8_t foc_mode = 3;                //控制模式：0=电压，1=电流，2=速度，3=位置
 volatile float id_ref = 0.0f;                 //d轴目标电流[A]，id=0控制（最大转矩/电流比）
 volatile float iq_ref = 0.2f;                 //q轴目标电流[A]，控制转矩（额定0.9A）
-volatile float current_kp = 4.89f;            //电流环Kp = Ls × ωc = 0.00326 × 1500
-volatile float current_ki = 12000.0f;         //电流环Ki = Rs × ωc = 10.32 × 1500
+//电流环增益按零极点对消整定：Kp = Ls·ωc，Ki = Rs·ωc，ωc = 1000 rad/s
+//之前反馈用的是5ms低通后的电流，滤波极点让电流环相位裕度只有约25°，所以有超调，
+//当时在线调到Kp≈2.5只是压住了超调。现在反馈改为未滤波电流，按公式取值即可
+volatile float current_kp = 3.26f;            //电流环Kp = 0.00326 × 1000
+volatile float current_ki = 10320.0f;         //电流环Ki = 10.32 × 1000
 
 //速度环参数（可在调试器中在线修改）
 volatile float rpm_ref = 50.0f;              //目标转速[rpm]
-volatile float speed_kp = 0.001f;             //速度环Kp，输出单位[A/rpm]
-volatile float speed_ki = 0.02f;              //速度环Ki，输出单位[A/(rpm·s)]
+//位置模式下三环等效为位置PID（θ单位rad，ω单位rad/s，9.55 = 60/2π）：
+//  刚度 P = speed_kp·position_kp + 9.55·speed_ki    [A/rad]
+//  阻尼 D = 9.55·speed_kp                           [A/(rad/s)]
+//  积分 I = speed_ki·position_kp                    [A/(rad·s)]
+//阻尼比约正比于 D/√P：来回摆说明阻尼不够，应加大speed_kp、减小speed_ki
+volatile float speed_kp = 0.002f;             //速度环Kp，输出单位[A/rpm]
+volatile float speed_ki = 0.01f;              //速度环Ki，输出单位[A/(rpm·s)]
 volatile float speed_lpf_tau = 0.005f;        //转速低通时间常数[s]，越大越平滑、延迟越大
+//手拨偏离时速度误差大，积分会一直攒到电流限幅0.9A，松手后这部分电流要先“放掉”，就会过冲
+//限制积分项只够克服齿槽转矩和摩擦即可
+volatile float speed_i_limit = 0.3f;          //速度环积分项限幅[A]
 
 //位置环参数（可在调试器中在线修改）
 volatile float pos_ref = 0.0f;                //目标位置[rad]，机械角度
-volatile float position_kp = 50.0f;           //位置环Kp，输出单位[rpm/rad]
+volatile float position_kp = 80.0f;           //位置环Kp，输出单位[rpm/rad]
 volatile float position_ki = 0.0f;            //位置环Ki（位置环只用P，静差由速度环积分消除）
 
 volatile FocDebug_t foc_dbg;
@@ -113,6 +124,7 @@ void PI_Init(PI_Controller_t *pi, float kp, float ki, float out_min, float out_m
   pi->kp = kp;
   pi->ki = ki;
   pi->integral = 0.0f;
+  pi->i_limit = (out_max > -out_min) ? out_max : -out_min;   //默认不额外限制
   pi->out_min = out_min;
   pi->out_max = out_max;
 }
@@ -132,6 +144,13 @@ float PI_Update(PI_Controller_t *pi, float error, float dt)
 
   //先试算本次积分，输出未饱和、或误差方向能让输出退出饱和时才接受
   integral_new = pi->integral + error * dt;
+  //积分项限幅：|ki·integral| ≤ i_limit
+  if (pi->ki > 0.0f)
+  {
+    float lim = pi->i_limit / pi->ki;
+    if (integral_new > lim) integral_new = lim;
+    else if (integral_new < -lim) integral_new = -lim;
+  }
   output = p_term + pi->ki * integral_new;
 
   if (output > pi->out_max)
@@ -265,7 +284,8 @@ static void Apply_Voltage(float ud, float uq, float theta_e)
   __HAL_HRTIM_SETCOMPARE(&hhrtim1, HRTIM_TIMERINDEX_TIMER_C, HRTIM_COMPAREUNIT_1, Cmp_Limit(cmp[2]));
 }
 
-//三相电流 -> Clarke -> Park(theta_e)，低通后存入 foc_dbg.id/iq
+//三相电流 -> Clarke -> Park(theta_e)
+//未滤波值存入 foc_dbg.id_raw/iq_raw，作电流环反馈；低通值存入 foc_dbg.id/iq，只用于显示
 static void Update_Idq(float theta_e)
 {
   ClarkeTransform_t clarke = { .ua = current_sample.Ia, .ub = current_sample.Ib, .uc = current_sample.Ic };
@@ -276,7 +296,10 @@ static void Update_Idq(float theta_e)
   park.u_beta  = clarke.u_beta;
   ParkTransform(&park, theta_e);
 
-  //一阶低通，时间常数约 5ms，只用于显示
+  foc_dbg.id_raw = park.u_d;
+  foc_dbg.iq_raw = park.u_q;
+
+  //一阶低通，时间常数约 5ms，只用于显示，不要用作控制反馈
   foc_dbg.id += 0.01f * (park.u_d - foc_dbg.id);
   foc_dbg.iq += 0.01f * (park.u_q - foc_dbg.iq);
 }
@@ -479,7 +502,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef* hadc)
       //支持在线调参
       pi_id.kp = current_kp;   pi_id.ki = current_ki;
       pi_iq.kp = current_kp;   pi_iq.ki = current_ki;
-      pi_speed.kp = speed_kp;  pi_speed.ki = speed_ki;
+      pi_speed.kp = speed_kp;  pi_speed.ki = speed_ki;  pi_speed.i_limit = speed_i_limit;
       pi_position.kp = position_kp;  pi_position.ki = position_ki;
 
       //不用的外环保持复位，切换模式时从零开始
@@ -527,8 +550,8 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef* hadc)
       {
         //电流环：电流模式用iq_ref，速度/位置模式用外环输出
         float iq_target = (foc_mode == FOC_MODE_CURRENT) ? iq_ref : iq_cmd_hold;
-        ud_out = PI_Update(&pi_id, id_ref - foc_dbg.id, PWM_TS);
-        uq_out = PI_Update(&pi_iq, iq_target - foc_dbg.iq, PWM_TS);
+        ud_out = PI_Update(&pi_id, id_ref - foc_dbg.id_raw, PWM_TS);
+        uq_out = PI_Update(&pi_iq, iq_target - foc_dbg.iq_raw, PWM_TS);
       }
       foc_dbg.mode = foc_mode;
 

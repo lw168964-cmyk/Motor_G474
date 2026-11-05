@@ -27,6 +27,7 @@ typedef struct
   float kp;              //比例增益
   float ki;              //积分增益
   float integral;        //积分累积值
+  float i_limit;         //积分项输出限幅（|ki·integral| ≤ i_limit），防止积分攒得过多
   float out_max;         //输出上限
   float out_min;         //输出下限
 } PI_Controller_t;
@@ -47,8 +48,10 @@ typedef struct
   float   diff_rev;      //反转时角度差平均值[rad]
   float   diff_mean;     //正反转平均，即零位误差[rad]，已用于修正theta_m0
   float   diff_span;     //CHECK阶段角度差最大值-最小值[rad]
-  float   id;            //d轴电流（低通后）[A]
-  float   iq;            //q轴电流（低通后）[A]
+  float   id;            //d轴电流（低通后，只用于显示）[A]
+  float   iq;            //q轴电流（低通后，只用于显示）[A]
+  float   id_raw;        //d轴电流（未滤波，电流环反馈）[A]
+  float   iq_raw;        //q轴电流（未滤波，电流环反馈）[A]
   float   rpm;           //机械转速[rpm]（每帧编码器差分+一阶低通）
   float   ud;            //d轴电压输出[V]
   float   uq;            //q轴电压输出[V]
@@ -83,6 +86,7 @@ extern volatile float rpm_ref;       //目标转速[rpm]
 extern volatile float speed_kp;      //速度环比例增益
 extern volatile float speed_ki;      //速度环积分增益
 extern volatile float speed_lpf_tau; //转速低通滤波时间常数[s]
+extern volatile float speed_i_limit; //速度环积分项限幅[A]
 
 //位置环控制参数
 extern volatile float pos_ref;       //目标位置[rad]，机械角度
