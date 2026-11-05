@@ -16,7 +16,8 @@ typedef enum
 typedef enum
 {
   FOC_MODE_VOLTAGE = 0,  //电压模式：直接设置Ud、Uq
-  FOC_MODE_CURRENT       //电流模式：电流环闭环控制Id、Iq
+  FOC_MODE_CURRENT,      //电流模式：电流环闭环控制Id、Iq
+  FOC_MODE_SPEED         //速度模式：速度环→电流环→电压
 } FocMode_t;
 
 //PI控制器
@@ -67,11 +68,16 @@ extern volatile float foc_uq;        //电压模式：RUN阶段q轴电压[V]
 extern volatile uint8_t foc_restart; //置1重新对齐和校验
 
 //电流环控制参数
-extern volatile uint8_t foc_mode;    //控制模式：0=电压模式，1=电流模式
+extern volatile uint8_t foc_mode;    //控制模式：0=电压，1=电流，2=速度
 extern volatile float id_ref;        //d轴目标电流[A]，通常设为0（id=0控制）
 extern volatile float iq_ref;        //q轴目标电流[A]，控制转矩
 extern volatile float current_kp;    //电流环比例增益
 extern volatile float current_ki;    //电流环积分增益
+
+//速度环控制参数
+extern volatile float rpm_ref;       //目标转速[rpm]
+extern volatile float speed_kp;      //速度环比例增益
+extern volatile float speed_ki;      //速度环积分增益
 
 void Driver_Init(void);
 void Driver_Enable(void);

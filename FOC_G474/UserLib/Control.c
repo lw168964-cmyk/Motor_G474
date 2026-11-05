@@ -26,8 +26,8 @@
 #define ALIGN_HOLD_TICKS  (PWM_FREQ)          //1.0s：电角度0，等转子稳定
 //校验：每段开环转动的电周期数，14个电周期 = 机械1圈
 #define CHECK_CYCLES      POLE_PAIRS
-//转速计算窗口：400个控制周期 = 20ms
-#define SPEED_WINDOW      400U
+//转速计算窗口：200个控制周期 = 10ms（缩短窗口减少延迟）
+#define SPEED_WINDOW      200U
 
 //电机：Rs=10.32Ω，Ls=3.26mH，额定0.9A，14对极；2V对应约0.19A，电压不要超过9V
 volatile float align_ud   = 2.0f;             //对齐/校验阶段d轴电压[V]
@@ -36,11 +36,16 @@ volatile float foc_uq     = 1.0f;             //电压模式：RUN阶段q轴电�
 volatile uint8_t foc_restart = 0;             //调试器中置1：重新执行对齐和校验
 
 //电流环参数（可在调试器中在线修改）
-volatile uint8_t foc_mode = 1;                //控制模式：0=电压模式，1=电流模式
+volatile uint8_t foc_mode = 2;                //控制模式：0=电压，1=电流，2=速度
 volatile float id_ref = 0.0f;                 //d轴目标电流[A]，id=0控制（最大转矩/电流比）
-volatile float iq_ref = 0.1f;                 //q轴目标电流[A]，控制转矩（额定0.9A）
+volatile float iq_ref = 0.2f;                 //q轴目标电流[A]，控制转矩（额定0.9A）
 volatile float current_kp = 4.89f;            //电流环Kp = Ls × ωc = 0.00326 × 1500
 volatile float current_ki = 12000.0f;         //电流环Ki = Rs × ωc = 10.32 × 1500
+
+//速度环参数（可在调试器中在线修改）
+volatile float rpm_ref = 50.0f;              //目标转速[rpm]
+volatile float speed_kp = 0.0002f;            //速度环Kp，输出单位[A/rpm]（降低到原来1/25）
+volatile float speed_ki = 0.002f;             //速度环Ki（降低到原来1/25）
 
 volatile FocDebug_t foc_dbg;
 
@@ -52,6 +57,9 @@ extern AS5048A_HandleTypeDef as5048a;          //main.c 中定义
 //d轴和q轴电流PI控制器
 static PI_Controller_t pi_id;
 static PI_Controller_t pi_iq;
+
+//速度环PI控制器
+static PI_Controller_t pi_speed;
 
 //状态机内部变量（只在ADC2注入回调中访问）
 static FocState_t state = FOC_STATE_ALIGN;
@@ -179,6 +187,9 @@ void Driver_Init(void)
   //初始化电流环PI控制器，输出限幅为母线电压
   PI_Init(&pi_id, current_kp, current_ki, -U_DC, U_DC);
   PI_Init(&pi_iq, current_kp, current_ki, -U_DC, U_DC);
+
+  //初始化速度环PI控制器，输出限幅为额定电流0.9A
+  PI_Init(&pi_speed, speed_kp, speed_ki, -0.9f, 0.9f);
 
   Reset_StateMachine();
 
@@ -422,21 +433,46 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef* hadc)
       //先采样电流并计算Id、Iq（用于电流环反馈）
       Update_Idq(theta_e);
 
-      //根据控制模式选择电压输出
-      if (foc_mode == FOC_MODE_CURRENT)
+      //根据控制模式选择输出
+      if (foc_mode == FOC_MODE_SPEED)
       {
-        //电流闭环模式：PI控制器计算Ud、Uq
-        //更新PI参数（支持在线调整）
+        //速度闭环模式：速度环PI→电流环PI→电压
+        //更新速度环PI参数（支持在线调整）
+        pi_speed.kp = speed_kp;
+        pi_speed.ki = speed_ki;
+
+        //速度环PI控制，输出为目标q轴电流
+        float rpm_err = rpm_ref - foc_dbg.rpm;
+        float iq_cmd = PI_Update(&pi_speed, rpm_err, PWM_TS);
+
+        //电流环PI控制
         pi_id.kp = current_kp;
         pi_id.ki = current_ki;
         pi_iq.kp = current_kp;
         pi_iq.ki = current_ki;
 
-        //电流环PI控制
+        float id_err = id_ref - foc_dbg.id;
+        float iq_err = iq_cmd - foc_dbg.iq;
+        ud_out = PI_Update(&pi_id, id_err, PWM_TS);
+        uq_out = PI_Update(&pi_iq, iq_err, PWM_TS);
+
+        foc_dbg.mode = FOC_MODE_SPEED;
+      }
+      else if (foc_mode == FOC_MODE_CURRENT)
+      {
+        //电流闭环模式：电流环PI→电压
+        pi_id.kp = current_kp;
+        pi_id.ki = current_ki;
+        pi_iq.kp = current_kp;
+        pi_iq.ki = current_ki;
+
         float id_err = id_ref - foc_dbg.id;
         float iq_err = iq_ref - foc_dbg.iq;
         ud_out = PI_Update(&pi_id, id_err, PWM_TS);
         uq_out = PI_Update(&pi_iq, iq_err, PWM_TS);
+
+        //切换到电流模式时复位速度环积分项
+        PI_Reset(&pi_speed);
 
         foc_dbg.mode = FOC_MODE_CURRENT;
       }
@@ -446,9 +482,10 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef* hadc)
         ud_out = 0.0f;
         uq_out = foc_uq;
 
-        //切换到电压模式时复位PI积分项，避免切回电流模式时积分饱和
+        //切换到电压模式时复位所有PI积分项
         PI_Reset(&pi_id);
         PI_Reset(&pi_iq);
+        PI_Reset(&pi_speed);
 
         foc_dbg.mode = FOC_MODE_VOLTAGE;
       }
